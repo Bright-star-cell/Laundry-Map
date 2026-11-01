@@ -11,4 +11,5 @@ coverage/
 backend/.env
 frontend/.env
 *.log
+*.tsbuildinfo
 .DS_Store

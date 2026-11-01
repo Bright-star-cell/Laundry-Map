@@ -311,7 +311,20 @@ npm test
 npm run build
 ```
 
-The current automated tests cover valid and invalid order-state transitions. Run the full commands in a Node.js environment with dependencies installed; integration checks require running PostgreSQL/PostGIS and Redis. Container-level validation requires Docker Compose.
+### Latest Verification (2026-11-01)
+
+No prior test-result reports are stored in the repository. This is the first recorded verification snapshot:
+
+| Check | Result | Measurement |
+| --- | --- | --- |
+| `npm ci` | Pass | Clean install from the committed workspace lockfile; 233 packages installed. |
+| `npm test` | Pass | 2 passed, 0 failed; valid lifecycle path and invalid/terminal transition cases. |
+| `npm run typecheck` | Pass | Backend and frontend TypeScript checks completed without errors. |
+| `npm run build` | Pass | Backend compiled; Next.js production build completed and statically generated `/`. |
+| PWA HTTP smoke test | Pass | `GET /` returned HTTP 200, 18,297 bytes, in 61 ms in this local single-request check. This is not a load benchmark. |
+| `npm audit --omit=dev` | Findings | 3 advisories in production dependencies: 1 moderate and 2 high, affecting Next.js/PostCSS and Zod. npm's suggested automatic fix requires breaking major-version upgrades; review and upgrade deliberately. |
+
+Database-backed order/payment tests and a Compose integration run were not performed because PostgreSQL/PostGIS, Redis, and Docker were unavailable in the test environment. The automated test suite currently covers the order state machine only; it does not yet include database, provider webhook, Socket.IO, or browser end-to-end coverage.
 
 ## Partner Provisioning
 
