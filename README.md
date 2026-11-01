@@ -257,6 +257,7 @@ io(API_URL, { auth: { token } });
 | --- | --- | --- |
 | Client to server | `order:subscribe` | Order ID; joins only if the caller is an authorized participant |
 | Client to server | `driver:location` | `{ orderId, latitude, longitude }`; courier-only, validated and persisted as the latest point |
+| Client to server | `health:ping` | Acknowledges an authenticated WebSocket round trip with a server timestamp |
 | Server to client | `order:created` | Newly paid order available to its customer or vendor |
 | Server to client | `order:status` | Status or payment-state update for authorized order participants |
 | Server to client | `vendor:accepted` | Vendor acceptance event for the order room |
@@ -308,23 +309,31 @@ Never treat the frontend redirect, a client event, or a provider response shown 
 npm ci
 npm run typecheck
 npm test
+npm run test:coverage
 npm run build
 ```
 
-### Latest Verification (2026-11-01)
+## System Test Scores & Quality Metrics
 
-No prior test-result reports are stored in the repository. This is the first recorded verification snapshot:
+**Verification timestamp:** `2026-11-01T13:56:43Z` · **Runtime:** Node.js 22 · **Environment:** local single-process test container. There were no earlier score reports in the repository; this section records the first full backend/PWA/API/WebSocket test run.
 
-| Check | Result | Measurement |
-| --- | --- | --- |
-| `npm ci` | Pass | Clean install from the committed workspace lockfile; 233 packages installed. |
-| `npm test` | Pass | 2 passed, 0 failed; valid lifecycle path and invalid/terminal transition cases. |
-| `npm run typecheck` | Pass | Backend and frontend TypeScript checks completed without errors. |
-| `npm run build` | Pass | Backend compiled; Next.js production build completed and statically generated `/`. |
-| PWA HTTP smoke test | Pass | `GET /` returned HTTP 200, 18,297 bytes, in 61 ms in this local single-request check. This is not a load benchmark. |
-| `npm audit --omit=dev` | Findings | 3 advisories in production dependencies: 1 moderate and 2 high, affecting Next.js/PostCSS and Zod. npm's suggested automatic fix requires breaking major-version upgrades; review and upgrade deliberately. |
+| Area | Metric | Result | Verification |
+| --- | --- | --- | --- |
+| Complete suite | Tests passed | **10 / 10 (100%)** | Passing ✅ |
+| Backend unit | Order lifecycle tests | **2 / 2** | Passing ✅ |
+| Backend API/WebSocket | HTTP and authenticated Socket.IO integration tests | **4 / 4** | Passing ✅; HTTP health, input validation, and WebSocket ping. These tests do not require a database. |
+| Frontend/PWA | Component and service-worker tests | **4 / 4** | Passing ✅; server-rendered customer home plus install, activate, offline fallback, and API-cache bypass. |
+| Instrumented coverage | Lines / branches / functions | **51.82% / 72.22% / 48.77%** | Measured with Node's test coverage. Includes the source modules loaded by this suite and test files; it is not full repository coverage. |
+| API latency | `GET /health/live`, 10 sequential local requests | **p50 7.53 ms / p95 42.52 ms** | Measured in the final `npm test` run; local only, not a production benchmark. |
+| WebSocket latency | Authenticated Socket.IO ping/ack RTT | **1.43 ms** | Measured in the final `npm test` run over a local WebSocket connection. |
+| PWA HTTP latency | 10 requests per route: `/`, `/manifest.json`, `/sw.js` | **p50 3.48 ms / 1.32 ms / 1.28 ms** | All returned HTTP 200; final-build localhost measurements. |
+| Lighthouse performance (simulated) | Performance score | **Not measured** | No browser or Lighthouse runner was available. HTTP timing is not a Lighthouse score. |
+| PostgreSQL/PostGIS/Redis | Database-backed integration | **Not run** | Docker and database services were unavailable; payment persistence and live Redis adapter behavior remain unverified. |
+| Type safety | `npm run typecheck` | **Pass** | Backend and frontend checks completed without errors. |
+| Production build | `npm run build` | **Pass** | Backend compiled; Next.js production build completed and statically generated `/` (22.6 kB route, 124 kB first-load JS). |
+| Dependency audit | `npm audit --omit=dev` | **3 advisories** | 1 moderate (Next.js), 2 high (PostCSS and Zod); review and upgrade deliberately. |
 
-Database-backed order/payment tests and a Compose integration run were not performed because PostgreSQL/PostGIS, Redis, and Docker were unavailable in the test environment. The automated test suite currently covers the order state machine only; it does not yet include database, provider webhook, Socket.IO, or browser end-to-end coverage.
+Run the score-producing checks with `npm test` and `npm run test:coverage`. The test framework is Node's built-in `node:test` with `tsx`; Jest and PyTest are not configured in this repository. API tests cover HTTP contracts and an authenticated WebSocket acknowledgement, but they do not replace database/payment-provider end-to-end tests. Do not treat the localhost latency measurements as service-level objectives.
 
 ## Partner Provisioning
 

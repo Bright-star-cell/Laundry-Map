@@ -8,7 +8,8 @@
   "scripts": {
     "dev": "concurrently -k -n api,web -c blue,green \"npm run dev -w @laundry-map/backend\" \"npm run dev -w @laundry-map/frontend\"",
     "build": "npm run build -w @laundry-map/backend && npm run build -w @laundry-map/frontend",
-    "test": "npm run test -w @laundry-map/backend",
+    "test": "npm run test -w @laundry-map/backend && npm run test -w @laundry-map/frontend",
+    "test:coverage": "node --experimental-test-coverage --import tsx --test backend/src/*.test.ts frontend/app/page.test.tsx frontend/public/sw.test.ts",
     "typecheck": "npm run typecheck -w @laundry-map/backend && npm run typecheck -w @laundry-map/frontend"
   },
   "devDependencies": {

@@ -23,10 +23,13 @@ if (!jwtSecret || jwtSecret.length < 32) throw new Error('JWT_SECRET must be at 
 
 const allowedOrigins = (process.env.WEB_ORIGIN ?? 'http://localhost:3000').split(',');
 const io = new Server(httpServer, { cors: { origin: allowedOrigins, credentials: true } });
-const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null });
+const isTestEnvironment = process.env.NODE_ENV === 'test';
+const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null, lazyConnect: isTestEnvironment });
 const redisSub = redis.duplicate();
-await Promise.all([redis.ping(), redisSub.ping()]);
-io.adapter(createAdapter(redis, redisSub));
+if (!isTestEnvironment) {
+  await Promise.all([redis.ping(), redisSub.ping()]);
+  io.adapter(createAdapter(redis, redisSub));
+}
 
 async function confirmPayment(provider: 'PAYSTACK' | 'FLUTTERWAVE', reference: string, amountKobo: number) {
   const client = await pool.connect();
@@ -81,6 +84,9 @@ io.on('connection', (socket) => {
   const user = socket.data.user as { id: string; role: string };
   socket.join(`user:${user.id}`);
   socket.join(`role:${user.role}`);
+  socket.on('health:ping', (acknowledge?: (result: { timestamp: number }) => void) => {
+    acknowledge?.({ timestamp: Date.now() });
+  });
   socket.on('order:subscribe', async (orderId: unknown, acknowledge?: (result: { ok: boolean }) => void) => {
     if (typeof orderId !== 'string' || orderId.length > 64) return acknowledge?.({ ok: false });
     const order = await getOrderForActor(orderId, user.id, user.role);
@@ -357,8 +363,10 @@ app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-const port = Number(process.env.PORT ?? 4000);
-httpServer.listen(port, '0.0.0.0', () => console.log(`Laundry Map API listening on ${port}`));
+if (!isTestEnvironment) {
+  const port = Number(process.env.PORT ?? 4000);
+  httpServer.listen(port, '0.0.0.0', () => console.log(`Laundry Map API listening on ${port}`));
+}
 
 async function shutdown() {
   httpServer.close();
@@ -366,5 +374,9 @@ async function shutdown() {
   process.exit(0);
 }
 
-process.on('SIGTERM', () => void shutdown());
-process.on('SIGINT', () => void shutdown());
+if (!isTestEnvironment) {
+  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown());
+}
+
+export { app, httpServer };
