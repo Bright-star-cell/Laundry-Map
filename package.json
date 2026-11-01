@@ -1,0 +1,20 @@
+{
+  "name": "laundry-map",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,green \"npm run dev -w @laundry-map/backend\" \"npm run dev -w @laundry-map/frontend\"",
+    "build": "npm run build -w @laundry-map/backend && npm run build -w @laundry-map/frontend",
+    "test": "npm run test -w @laundry-map/backend",
+    "typecheck": "npm run typecheck -w @laundry-map/backend && npm run typecheck -w @laundry-map/frontend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=20.11"
+  }
+}

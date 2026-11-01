@@ -1,0 +1,22 @@
+{
+  "name": "Laundry Map",
+  "dockerComposeFile": "../docker-compose.yml",
+  "service": "dev",
+  "workspaceFolder": "/workspaces/Laundry-Map",
+  "runServices": ["postgres", "redis", "dev"],
+  "shutdownAction": "stopCompose",
+  "forwardPorts": [3000, 4000, 5432, 6379],
+  "portsAttributes": {
+    "3000": { "label": "Laundry Map PWA", "onAutoForward": "openBrowser" },
+    "4000": { "label": "Laundry Map API", "onAutoForward": "notify" }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": true, "installDockerBuildx": true }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint", "esbenp.prettier-vscode", "bradlc.vscode-tailwindcss", "ms-azuretools.vscode-docker", "mtxr.sqltools", "mtxr.sqltools-driver-pg"],
+      "settings": { "editor.formatOnSave": true, "typescript.tsdk": "node_modules/typescript/lib" }
+    }
+  }
+}
