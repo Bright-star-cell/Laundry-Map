@@ -10,6 +10,8 @@ process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = testSecret;
 process.env.DATABASE_URL = 'postgres://laundry:laundry@127.0.0.1:5432/laundry_map';
 process.env.REDIS_URL = 'redis://127.0.0.1:6379';
+process.env.WEB_ORIGIN = 'http://localhost:3000';
+process.env.NEXT_PUBLIC_API_URL = 'http://localhost:4000';
 
 const { httpServer } = await import('./server.js');
 const server = httpServer;

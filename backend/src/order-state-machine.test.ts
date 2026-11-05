@@ -19,10 +19,11 @@ test('accepts each adjacent transition in the complete order lifecycle', () => {
   }
 });
 
-test('allows cancellation from active states and rejects terminal or skipped transitions', () => {
-  for (const status of orderStatuses.slice(0, -2)) {
+test('allows cancellation only before pickup and rejects terminal or skipped transitions', () => {
+  for (const status of ['CREATED', 'DRIVER_ASSIGNED_FOR_PICKUP'] as const) {
     assert.equal(canTransitionOrder(status, 'CANCELLED'), true);
   }
+  for (const status of orderStatuses.slice(2)) assert.equal(canTransitionOrder(status, 'CANCELLED'), false);
   assert.equal(canTransitionOrder('CREATED', 'PICKED_UP'), false);
   assert.equal(canTransitionOrder('DELIVERED', 'CANCELLED'), false);
   assert.equal(canTransitionOrder('CANCELLED', 'CREATED'), false);

@@ -6,6 +6,8 @@ COPY frontend/package.json frontend/package.json
 RUN npm ci
 
 FROM dependencies AS build
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 COPY frontend frontend
 RUN npm run build -w @laundry-map/frontend
 

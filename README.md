@@ -6,7 +6,7 @@ Laundry Map is a multi-persona laundry marketplace for a pilot in the Karu and M
 
 This repository is an npm-workspaces monorepo. It includes a Next.js Progressive Web App, an Express and Socket.IO API, PostgreSQL with PostGIS, Redis, Docker Compose, and a GitHub Codespaces development container.
 
-> **Deployment status:** This is a pilot application codebase, not a turnkey public-production deployment. The Compose `production` profile is for local or staging smoke tests and includes development database credentials and a development JWT fallback. Review [Production Readiness](#production-readiness) before deploying to real users.
+> **Deployment status:** Production startup now requires externally managed secrets, HTTPS public origins, TLS PostgreSQL, and authenticated TLS Redis. Validate migrations, provider webhooks, backups, and proxy behavior against the actual managed services in staging before handling live orders.
 
 ## Contents
 
@@ -32,7 +32,7 @@ This repository is an npm-workspaces monorepo. It includes a Next.js Progressive
 - Wash & Fold, Dry Cleaning, and Ironing services with vendor-specific catalog pricing.
 - Nearby vendor search using PostGIS geography and Karu/Mararaba pilot seed data.
 - Transactional order creation, status history, server-calculated commission, and row-locked state transitions.
-- Paystack checkout initialization with signature-verified payment webhooks; Flutterwave signature verification for payment confirmation.
+- Paystack and Flutterwave checkout initialization with signed, idempotent webhooks and payment-reconciliation logging.
 - Two-minute vendor acceptance window, first-come courier assignment, dual-leg routing, and customer delivery-code verification.
 - JWT-authenticated Socket.IO events with Redis adapter support for multi-instance fan-out.
 - Opt-in courier location sharing, network-only API requests, and an offline-resilient PWA shell.
@@ -80,8 +80,8 @@ The API owns validation, pricing, authorization, order transitions, and payment 
 
 1. A customer selects a vendor and services in the PWA.
 2. The API validates the request, reads prices from that vendor's catalog, and creates the order and item rows in one database transaction.
-3. The customer is redirected to Paystack checkout. A browser redirect alone does not mark the order paid.
-4. The provider webhook is signature-checked; the reference, amount, and NGN currency are verified before payment and order state are updated transactionally.
+3. The customer chooses Paystack or Flutterwave and is redirected to the selected provider. A browser redirect alone does not mark the order paid.
+4. The provider webhook signature and unique event ID are checked; reference, amount, and NGN currency are verified before payment and order state are updated transactionally.
 5. The vendor receives a real-time paid-order event and has two minutes to accept.
 6. A courier claims an eligible dispatch. The same courier handles pickup and return; authenticated status and location events are sent to authorized order subscribers.
 7. The courier completes delivery only after validating the customer's six-digit code.
@@ -98,13 +98,8 @@ stateDiagram-v2
   PROCESSING --> READY_FOR_DELIVERY: vendor marks ready
   READY_FOR_DELIVERY --> DRIVER_ASSIGNED_FOR_DROPOFF: assigned courier starts return
   DRIVER_ASSIGNED_FOR_DROPOFF --> DELIVERED: valid customer OTP
-  CREATED --> CANCELLED
-  DRIVER_ASSIGNED_FOR_PICKUP --> CANCELLED
-  PICKED_UP --> CANCELLED
-  AT_LAUNDROMAT --> CANCELLED
-  PROCESSING --> CANCELLED
-  READY_FOR_DELIVERY --> CANCELLED
-  DRIVER_ASSIGNED_FOR_DROPOFF --> CANCELLED
+  CREATED --> CANCELLED: customer/admin before pickup
+  DRIVER_ASSIGNED_FOR_PICKUP --> CANCELLED: customer/admin before pickup
   DELIVERED --> [*]
   CANCELLED --> [*]
 ```
@@ -115,7 +110,7 @@ State transitions are checked in application code and performed under `SELECT ..
 
 | Area | Implementation |
 | --- | --- |
-| Web | Next.js 15 App Router, React 19, TypeScript, Tailwind CSS, Lucide icons |
+| Web | Next.js 16 App Router, React 19, TypeScript, Tailwind CSS, Lucide icons |
 | API | Node.js 22, Express 4, TypeScript, Zod |
 | Real time | Socket.IO with Redis adapter |
 | Persistence | PostgreSQL 16, PostGIS, parameterized SQL, `pg` connection pool |
@@ -151,21 +146,22 @@ cp .env.example .env
 docker compose --profile development up --build
 ```
 
-Open the forwarded **3000** port for the PWA. The API listens on **4000**. PostgreSQL and Redis are available on **5432** and **6379** for local tools. Compose waits for both data services' health checks before starting the application.
+Open the forwarded **3000** port for the PWA. The API listens on **4000**. PostgreSQL and authenticated Redis are available on **5432** and **6379** for local tools. Compose waits for both data services' health checks, applies pending migrations, and then starts the application.
 
 ### Host-Based Development
 
 Requirements: Node.js 22 (the workspace supports Node.js 20.11 or later) and Docker Compose v2.
 
 ```sh
-docker compose up -d postgres redis
+docker compose --profile development up -d postgres redis
 cp backend/.env.example backend/.env
 cp frontend/.env.example frontend/.env.local
+docker compose --profile development up -d postgres redis
 npm ci
 npm run dev
 ```
 
-The backend loads `backend/.env`; Next.js loads `frontend/.env.local`. To stop the data services, run `docker compose down`. The named database volume persists across restarts. Initialization scripts run only when PostgreSQL creates a new, empty data directory.
+The backend loads `backend/.env`; Next.js loads `frontend/.env.local`. Apply pending schema changes with `npm run migrate:dev -w @laundry-map/backend` after the database is available. To stop the data services, run `docker compose --profile development down`. The named database volume persists across restarts. The image initialization scripts seed only a new, empty data directory; later schema changes use the migration runner.
 
 > `docker compose down -v` deletes the persistent database and Redis volumes. Use it only when you intentionally want to erase local data and reload the seed.
 
@@ -175,8 +171,9 @@ The backend loads `backend/.env`; Next.js loads `frontend/.env.local`. To stop t
 | --- | --- |
 | `npm run dev` | Run API and web development servers concurrently |
 | `npm run typecheck` | Typecheck both workspaces |
-| `npm test` | Run backend order-state-machine tests |
-| `npm run build` | Build backend and Next.js frontend |
+| `npm test` | Run backend, frontend, API, payment verification, and service-worker tests |
+| `NEXT_PUBLIC_API_URL=https://api.example.com npm run build` | Build backend and Next.js frontend with the required public API origin |
+| `npm run migrate:dev -w @laundry-map/backend` | Apply tracked schema migrations from a development shell |
 | `npm run provision:partner -w @laundry-map/backend` | Create a vendor or courier account |
 
 ## Configuration
@@ -185,17 +182,20 @@ Compose reads the root `.env`. For direct host development, use the backend and 
 
 | Variable | Used by | Description |
 | --- | --- | --- |
-| `JWT_SECRET` | API, Compose | Signing and OTP-encryption key; use a random secret of at least 32 characters. The Compose fallback is development-only. |
+| `JWT_SECRET` | API, Compose | Environment-store secret for signing and OTP encryption; at least 32 characters. Required in every profile and has no production fallback. |
 | `JWT_EXPIRES_IN` | API | JWT lifetime; defaults to `12h`. |
-| `WEB_ORIGIN` | API | Allowed browser origins; comma-separated values are supported. |
-| `DATABASE_URL` | API | PostgreSQL connection string. Host default: `postgres://laundry:laundry@localhost:5432/laundry_map`. |
-| `DATABASE_SSL` | API | Set to `true` when the PostgreSQL provider requires TLS. |
-| `REDIS_URL` | API | Redis connection string. Host default: `redis://localhost:6379`. |
-| `NEXT_PUBLIC_API_URL` | Web | Public API origin; defaults to `http://localhost:4000`. |
-| `PAYSTACK_SECRET_KEY` | API | Paystack secret used for checkout initialization and webhook signature verification. |
-| `FLUTTERWAVE_SECRET_HASH` | API | Expected Flutterwave webhook `verif-hash` value. |
+| `WEB_ORIGIN` | API | Comma-separated valid browser origins; HTTPS is mandatory in production. |
+| `DATABASE_URL` | API | PostgreSQL connection string. Production value must be supplied by the deployment secret store. |
+| `DATABASE_SSL` | API | Must be `true` in production; certificate validation is enabled. |
+| `REDIS_URL` | API | Development Redis URL may use local credentials; production must use authenticated `rediss://`. |
+| `NEXT_PUBLIC_API_URL` | Web and API | Required public API URL; HTTPS is mandatory in production and it is embedded at web build time. |
+| `PAYSTACK_SECRET_KEY` | API | Environment-store secret for Paystack initialization and HMAC-SHA512 webhook verification. |
+| `FLUTTERWAVE_SECRET_KEY` | API | Environment-store secret for Flutterwave checkout initialization. |
+| `FLUTTERWAVE_SECRET_HASH` | API | Environment-store secret used to verify Flutterwave webhook HMAC signatures over the raw body. |
+| `TRUST_PROXY` | API | Trusted proxy hop count or address list; production must set this to match the ingress topology. |
+| `SOCKET_IO_TRANSPORTS` | API | Comma-separated `websocket` and/or `polling`; production polling requires sticky sessions at the load balancer. |
 
-Do not commit `.env` files, production keys, credentials, or customer data. The committed examples contain only local development values or empty provider secrets.
+Do not commit `.env` files, production keys, credentials, or customer data. Example values are for local development only. The Compose `production` profile rejects missing secrets and has no credential or URL fallback.
 
 ## Personas and Workflows
 
@@ -233,8 +233,8 @@ All routes are served from the API origin. Routes marked **JWT** require `Author
 | `POST /api/orders` | Customer JWT | Create order with server-side catalog pricing |
 | `GET /api/orders` | Customer JWT | List customer's orders and timeline |
 | `GET /api/orders/:id` | Participant JWT | Read an order visible to the caller |
-| `PATCH /api/orders/:id/status` | Participant JWT | Request a role-authorized lifecycle transition |
-| `POST /api/payments/initialize` | Customer JWT | Initialize Paystack checkout |
+| `PATCH /api/orders/:id/status` | Participant JWT | Request a role-authorized lifecycle transition; customer cancellation is limited to before pickup |
+| `POST /api/payments/initialize` | Customer JWT | Initialize Paystack or Flutterwave checkout with `{ "orderId": "...", "provider": "PAYSTACK" }` or `FLUTTERWAVE` |
 | `POST /api/payments/paystack/webhook` | Paystack signature | Verify and confirm a Paystack payment |
 | `POST /api/payments/flutterwave/webhook` | Flutterwave hash | Verify and confirm a Flutterwave payment |
 | `GET /api/vendor/orders` | Vendor JWT | List paid vendor orders |
@@ -264,7 +264,7 @@ io(API_URL, { auth: { token } });
 | Server to client | `dispatch:available` | Signals courier clients to refresh eligible jobs |
 | Server to client | `driver:location` | Latest courier coordinates for subscribed order clients |
 
-The Redis adapter allows Socket.IO events to cross API instances. If long-polling is enabled behind a multi-instance load balancer, configure sticky sessions; alternatively, use a WebSocket-only transport where supported.
+The Redis adapter allows Socket.IO events to cross API instances. Production configures an HTTP-only secure affinity cookie and honors forwarded headers only from the `TRUST_PROXY` addresses/hops. The ingress must forward `X-Forwarded-Proto` and WebSocket upgrade headers. If polling is enabled behind a multi-instance load balancer, configure cookie-based sticky sessions; alternatively set `SOCKET_IO_TRANSPORTS=websocket` where clients and ingress support it.
 
 ## Data and Performance
 
@@ -296,10 +296,11 @@ These are implementation choices, not benchmark claims. Measure query plans, poo
 - Passwords are hashed with bcrypt; request bodies and coordinates are validated with Zod.
 - JWT authentication and role checks protect REST routes and Socket.IO subscriptions. Order-room membership is checked against the database.
 - Helmet, CORS allowlisting, and API rate limiting are enabled.
-- Paystack signatures use HMAC-SHA512 and constant-time comparison. Flutterwave's configured `verif-hash` is also checked with constant-time comparison.
-- Confirmations require a matching initialized provider reference, exact amount, and NGN currency. The payment row and order's paid state are updated in one transaction.
+- Paystack signatures use HMAC-SHA512 and Flutterwave signatures use HMAC-SHA256; both use constant-time comparison against the exact raw body. Legacy shared-hash-only Flutterwave headers are rejected.
+- Webhook event IDs are persisted with payload hashes to make retries idempotent. Confirmations require a matching initialized provider reference, exact amount, and NGN currency. Payment, order, and webhook event updates share a database transaction.
+- Invalid amounts/currencies, unknown references, late payment events, and cancellation races are written to reconciliation logs; they never mark a cancelled order paid.
 - Delivery codes are generated with a cryptographically secure random source. The database stores a bcrypt verification hash and a separately AES-GCM-encrypted copy so the customer can retrieve the code after signing in. The encryption key is derived from `JWT_SECRET`; protect and rotate that key accordingly.
-- API requests are not cached by the service worker. Courier coordinates require an explicit user action in the PWA and are available only to authorized order participants.
+- API requests are never cached by the service worker. Navigations use a network-first strategy with the cached root shell as the offline fallback; only the shell and versioned Next.js static assets enter the runtime cache. Courier coordinates require an explicit user action and are available only to authorized order participants.
 
 Never treat the frontend redirect, a client event, or a provider response shown in the browser as proof of payment. Configure provider webhooks to reach the deployed API over HTTPS.
 
@@ -315,25 +316,25 @@ npm run build
 
 ## System Test Scores & Quality Metrics
 
-**Verification timestamp:** `2026-11-01T13:56:43Z` · **Runtime:** Node.js 22 · **Environment:** local single-process test container. There were no earlier score reports in the repository; this section records the first full backend/PWA/API/WebSocket test run.
+**Verification timestamp:** `2026-11-05` · **Runtime:** Node.js 24.22.1 · **Environment:** local single-process test container. Database-backed migration and provider settlement tests require external PostgreSQL/PostGIS/Redis and provider sandbox credentials and were not run here.
 
 | Area | Metric | Result | Verification |
 | --- | --- | --- | --- |
-| Complete suite | Tests passed | **10 / 10 (100%)** | Passing ✅ |
-| Backend unit | Order lifecycle tests | **2 / 2** | Passing ✅ |
-| Backend API/WebSocket | HTTP and authenticated Socket.IO integration tests | **4 / 4** | Passing ✅; HTTP health, input validation, and WebSocket ping. These tests do not require a database. |
-| Frontend/PWA | Component and service-worker tests | **4 / 4** | Passing ✅; server-rendered customer home plus install, activate, offline fallback, and API-cache bypass. |
-| Instrumented coverage | Lines / branches / functions | **51.82% / 72.22% / 48.77%** | Measured with Node's test coverage. Includes the source modules loaded by this suite and test files; it is not full repository coverage. |
-| API latency | `GET /health/live`, 10 sequential local requests | **p50 7.53 ms / p95 42.52 ms** | Measured in the final `npm test` run; local only, not a production benchmark. |
-| WebSocket latency | Authenticated Socket.IO ping/ack RTT | **1.43 ms** | Measured in the final `npm test` run over a local WebSocket connection. |
-| PWA HTTP latency | 10 requests per route: `/`, `/manifest.json`, `/sw.js` | **p50 3.48 ms / 1.32 ms / 1.28 ms** | All returned HTTP 200; final-build localhost measurements. |
+| Complete suite | Tests passed | **20 / 20 (100%)** | Passing |
+| Backend unit | Configuration, lifecycle, and payment verification tests | **11 / 11** | Passing; strict runtime/database validation, pre-pickup cancellation rules, and Paystack/Flutterwave signature and payload parsing checks. |
+| Backend API/WebSocket | HTTP and authenticated Socket.IO integration tests | **4 / 4** | Passing; health, validation, and WebSocket ping. These tests do not require a database. |
+| Frontend/PWA | Component and service-worker tests | **5 / 5** | Passing; server-rendered customer home plus install, activation, offline navigation, API-cache bypass, and versioned asset caching. |
+| Instrumented coverage | Lines / branches / functions | **45.76% / 69.54% / 42.66%** | Measured with Node's test coverage. Includes source modules loaded by this suite; it is not full repository coverage. |
+| API latency | `GET /health/live`, 10 sequential local requests | **p50 2.79 ms / p95 53.42 ms** | Current `npm test` run; local only, not a production benchmark. |
+| WebSocket latency | Authenticated Socket.IO ping/ack RTT | **1.99 ms** | Current `npm test` run over a local WebSocket connection. |
+| PWA HTTP latency | `/`, `/manifest.json`, `/sw.js` | **Not remeasured after the Next.js 16 upgrade** | Prior measurements are not carried forward as current performance claims. |
 | Lighthouse performance (simulated) | Performance score | **Not measured** | No browser or Lighthouse runner was available. HTTP timing is not a Lighthouse score. |
 | PostgreSQL/PostGIS/Redis | Database-backed integration | **Not run** | Docker and database services were unavailable; payment persistence and live Redis adapter behavior remain unverified. |
 | Type safety | `npm run typecheck` | **Pass** | Backend and frontend checks completed without errors. |
-| Production build | `npm run build` | **Pass** | Backend compiled; Next.js production build completed and statically generated `/` (22.6 kB route, 124 kB first-load JS). |
-| Dependency audit | `npm audit --omit=dev` | **3 advisories** | 1 moderate (Next.js), 2 high (PostCSS and Zod); review and upgrade deliberately. |
+| Production build | `NEXT_PUBLIC_API_URL=https://api.laundry-map.example npm run build` | **Pass** | Backend compiled; Next.js 16 production build completed and statically generated `/`. |
+| Dependency audit | `npm audit --omit=dev` | **0 vulnerabilities** | Patched Next.js 16 and Zod 4 dependencies. |
 
-Run the score-producing checks with `npm test` and `npm run test:coverage`. The test framework is Node's built-in `node:test` with `tsx`; Jest and PyTest are not configured in this repository. API tests cover HTTP contracts and an authenticated WebSocket acknowledgement, but they do not replace database/payment-provider end-to-end tests. Do not treat the localhost latency measurements as service-level objectives.
+Run the score-producing checks with `npm test` and `npm run test:coverage`. The test framework is Node's built-in `node:test` with `tsx`; Jest and PyTest are not configured in this repository. API tests cover HTTP contracts and an authenticated WebSocket acknowledgement, while payment tests cover pure signature and event parsing behavior; they do not replace database/payment-provider end-to-end tests. Do not treat localhost latency measurements as service-level objectives.
 
 ## Partner Provisioning
 
@@ -359,26 +360,25 @@ The seeded `.example` vendor accounts populate the local directory only; they ar
 
 ## Production Readiness
 
-Before a public launch:
+Implemented production controls:
 
-- Replace all Compose defaults with secret-managed credentials; use a strong unique `JWT_SECRET` of at least 32 characters.
-- Use managed PostgreSQL with PostGIS and Redis, private networking, TLS, backups, restore drills, and monitored resource limits.
-- Set `DATABASE_SSL=true` when required by the database provider and configure the public HTTPS origin in `WEB_ORIGIN` and `NEXT_PUBLIC_API_URL`.
-- Configure Paystack and/or Flutterwave webhook secrets and verify provider-side webhook delivery and retry behavior in a staging environment.
-- Add a production migration runner and migration history. The current SQL files are PostgreSQL image initialization scripts and execute only for a newly initialized data volume.
-- Add structured logs, metrics, tracing, alerting, an incident process, and tested backup/restore procedures.
-- Review privacy, data retention, customer support, refunds, payment reconciliation, vendor onboarding, and Nigerian legal/regulatory requirements for the operating model.
-- Configure reverse-proxy WebSocket support and sticky sessions if Socket.IO polling is enabled across multiple API instances.
-- Complete security review and load testing; the project does not publish an SLA or performance benchmark.
+- Runtime validation requires a 32-character `JWT_SECRET`, valid `WEB_ORIGIN`, and an HTTPS `NEXT_PUBLIC_API_URL` in production. Production database connections require `DATABASE_SSL=true`; Redis requires authenticated `rediss://`.
+- The production Compose profile rejects missing externally managed database/cache URLs and payment/JWT keys; it has no development credential fallback and does not start local database services.
+- `npm run migrate -w @laundry-map/backend` serializes deploys with a PostgreSQL advisory lock, records filenames and SHA-256 checksums in `laundry_map_schema_migrations`, applies each SQL migration transactionally, and rejects edits to already-applied migrations. Existing databases with the original `users` table are baselined at `001_init.sql`; new databases apply it before later migrations.
+- Payment webhook event IDs and payload hashes are stored transactionally. Reconciliation-required payments and cancellation races are recorded for operational follow-up.
+- Socket.IO supports Redis fan-out, a secure affinity cookie for production polling, origin validation, and explicit trusted-proxy configuration.
+- The service worker avoids API and arbitrary page caching and uses the installed app shell for offline navigations.
 
-The Compose `production` profile builds production-mode containers for local/staging verification, but it still uses the local database credentials and development JWT fallback unless overridden. Do not expose it publicly as-is.
+Before a public launch, deploy against managed PostgreSQL/PostGIS and Redis, validate the migration and rollback process, test both payment providers' signatures/retries in their sandboxes, and verify proxy affinity and forwarded headers. Add database-backed integration tests, refund execution, structured metrics/tracing/alerting, backup restore drills, privacy and retention policies, customer support procedures, and a review of Nigerian legal/regulatory requirements. Complete independent security review and load testing; this repository does not publish an SLA or production benchmark.
+
+The Compose `production` profile is an application container deployment template, not a managed-services or secret-store provisioner. Inject required values from the deployment platform's secret store and set the trusted proxy topology explicitly.
 
 ## Current Boundaries
 
-- Paystack checkout initialization is implemented. Flutterwave webhook verification is implemented, but Flutterwave checkout initialization is not.
-- Refund execution and reconciliation workflows are not implemented. A customer cannot cancel a paid order through the lifecycle endpoint.
+- Paystack and Flutterwave checkout initialization and webhook verification are implemented. Provider sandbox settlement and database-backed delivery/retry behavior still require staging verification.
+- Refund execution is not implemented. Customers can cancel only before pickup; paid cancellation is rejected and creates a reconciliation record for operations.
 - There is no public vendor/courier registration, admin dashboard, automatic courier dispatch algorithm, geocoding provider, or address autocomplete.
-- Database schema/seed scripts are bootstrapped by the PostGIS container on an empty data volume; they are not a general-purpose migration system.
-- The application has unit coverage for the order state machine, but no database, payment-provider, Socket.IO, or browser end-to-end test suite yet.
+- The PostGIS image still uses `001_init.sql` and `002_seed.sql` for local empty-volume bootstrap. Production schema evolution uses the tracked SQL migration runner; the runner and migrations need verification against the actual managed database provider.
+- Tests cover pure payment signature/event parsing, the order state machine, HTTP contracts, authenticated WebSocket ping, and PWA shell behavior. Database-backed migration/payment, provider sandbox, browser end-to-end, and multi-instance tests are not included.
 
 See [LICENSE](LICENSE) for license terms.

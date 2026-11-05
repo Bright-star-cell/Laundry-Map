@@ -4,7 +4,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { ArrowDownRight, ArrowUpRight, Check, Clock3, LocateFixed, LogIn, LogOut, MapPin, PackageCheck, Shirt, Sparkles, Truck, WashingMachine } from 'lucide-react';
 
-const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+const API = process.env.NEXT_PUBLIC_API_URL!;
 const serviceLabels: Record<string, string> = { WASH_AND_FOLD: 'Wash & fold', DRY_CLEANING: 'Dry cleaning', IRONING: 'Ironing' };
 const statusLabels: Record<string, string> = {
   CREATED: 'Order received', DRIVER_ASSIGNED_FOR_PICKUP: 'Courier heading to you', PICKED_UP: 'Picked up',
@@ -19,7 +19,7 @@ const services = [
 
 type Persona = 'customer' | 'vendor' | 'courier';
 type Vendor = { id: string; business_name: string; address: string; distance_meters: number; services: { service: string; priceKobo: number }[] };
-type Order = { id: string; status: string; payment_status?: string; subtotal_kobo?: number; created_at?: string; pickup_address?: string; delivery_address?: string; deliveryOtp?: string | null; history?: { status: string; at: string }[]; vendor_accepted_at?: string | null; vendor_response_deadline?: string; items?: { service: string; quantity: number }[] };
+type Order = { id: string; status: string; payment_status?: string; payment_reconciliation_required?: boolean; subtotal_kobo?: number; created_at?: string; pickup_address?: string; delivery_address?: string; deliveryOtp?: string | null; history?: { status: string; at: string }[]; vendor_accepted_at?: string | null; vendor_response_deadline?: string; items?: { service: string; quantity: number }[] };
 type Job = Order & { business_name: string; vendor_latitude: number; vendor_longitude: number; pickup_latitude: number; pickup_longitude: number; delivery_latitude: number; delivery_longitude: number; assigned_to_me: boolean };
 
 async function request<T>(path: string, token: string, init?: RequestInit): Promise<T> {
@@ -43,6 +43,7 @@ export default function Home() {
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [selectedVendor, setSelectedVendor] = useState('');
   const [selectedServices, setSelectedServices] = useState<string[]>(['WASH_AND_FOLD']);
+  const [paymentProvider, setPaymentProvider] = useState<'PAYSTACK' | 'FLUTTERWAVE'>('PAYSTACK');
   const [address, setAddress] = useState('');
   const [deliveryAddress, setDeliveryAddress] = useState('');
   const [pickupPoint, setPickupPoint] = useState({ latitude: 8.9912, longitude: 7.6031 });
@@ -82,15 +83,15 @@ export default function Home() {
 
   useEffect(() => {
     if (!token || !user) return;
-    const connection = io(API, { auth: { token }, transports: ['websocket', 'polling'] });
+    const connection = io(API, { auth: { token }, transports: ['websocket', 'polling'], withCredentials: true });
     connection.on('connect_error', () => setNotice('Live connection unavailable. Refresh to reconnect.'));
-    connection.on('order:status', (event: { id: string; status?: string; paymentStatus?: string }) => {
+    connection.on('order:status', (event: { id: string; status?: string; paymentStatus?: string; paymentReconciliationRequired?: boolean }) => {
       setOrders((current) => current.map((order) => {
         if (order.id !== event.id) return order;
         const history = event.status && order.history?.at(-1)?.status !== event.status
           ? [...(order.history ?? []), { status: event.status, at: new Date().toISOString() }]
           : order.history;
-        return { ...order, status: event.status ?? order.status, payment_status: event.paymentStatus ?? order.payment_status, history };
+        return { ...order, status: event.status ?? order.status, payment_status: event.paymentStatus ?? order.payment_status, payment_reconciliation_required: event.paymentReconciliationRequired ?? order.payment_reconciliation_required, history };
       }));
       if (event.status) setJobs((current) => current.map((job) => job.id === event.id ? { ...job, status: event.status! } : job));
       setNotice(event.status ? statusLabels[event.status] ?? 'Order updated' : 'Payment confirmed');
@@ -209,10 +210,28 @@ export default function Home() {
       sessionStorage.setItem(`laundryMapOtp:${created.id}`, created.deliveryOtp ?? '');
       setOrders((current) => [created, ...current]);
       socket?.emit('order:subscribe', created.id);
-      const payment = await request<{ authorizationUrl: string }>('/api/payments/initialize', token, { method: 'POST', body: JSON.stringify({ orderId: created.id }) });
-      window.location.assign(payment.authorizationUrl);
+      await redirectToCheckout(created.id);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Unable to place order');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function redirectToCheckout(orderId: string) {
+    const payment = await request<{ authorizationUrl: string }>('/api/payments/initialize', token, {
+      method: 'POST',
+      body: JSON.stringify({ orderId, provider: paymentProvider }),
+    });
+    window.location.assign(payment.authorizationUrl);
+  }
+
+  async function retryCheckout(orderId: string) {
+    setBusy(true);
+    try {
+      await redirectToCheckout(orderId);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Unable to restart checkout');
     } finally {
       setBusy(false);
     }
@@ -245,7 +264,7 @@ export default function Home() {
   async function updateOrder(orderId: string, status: string) {
     try {
       const result = await request<Order>(`/api/orders/${orderId}/status`, token, { method: 'PATCH', body: JSON.stringify({ status }) });
-      setOrders((current) => current.map((order) => order.id === orderId ? { ...order, status: result.status } : order));
+      setOrders((current) => current.map((order) => order.id === orderId ? { ...order, ...result } : order));
       setJobs((current) => current.map((job) => job.id === orderId ? { ...job, status: result.status } : job));
       setNotice(statusLabels[status] ?? 'Order updated');
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Unable to update order'); }
@@ -283,6 +302,10 @@ export default function Home() {
       <nav className="persona-nav" aria-label="Choose workspace">
         {(['customer', 'vendor', 'courier'] as Persona[]).map((value) => <button key={value} className={persona === value ? 'persona-tab active' : 'persona-tab'} onClick={() => choosePersona(value)}>{value === 'customer' ? <Shirt size={16} /> : value === 'vendor' ? <WashingMachine size={16} /> : <Truck size={16} />}{value === 'customer' ? 'Customer' : value === 'vendor' ? 'Laundry partner' : 'Courier'}{persona === value && <span className="tab-indicator" />}</button>)}
       </nav>
+
+      {persona === 'customer' && user?.role === 'CUSTOMER' && <label className="field-label payment-provider-control" htmlFor="payment-provider">Payment provider <select id="payment-provider" value={paymentProvider} onChange={(event) => setPaymentProvider(event.target.value as 'PAYSTACK' | 'FLUTTERWAVE')}><option value="PAYSTACK">Paystack</option><option value="FLUTTERWAVE">Flutterwave</option></select></label>}
+      {persona === 'customer' && user?.role === 'CUSTOMER' && orders.filter((order) => order.status === 'CREATED' && order.payment_status === 'FAILED' && !order.payment_reconciliation_required).map((order) => <button className="text-button" key={`retry-${order.id}`} disabled={busy} onClick={() => void retryCheckout(order.id)}>Retry payment for order #{order.id.slice(0, 8)}</button>)}
+      {persona === 'customer' && orders.filter((order) => ['CREATED', 'DRIVER_ASSIGNED_FOR_PICKUP'].includes(order.status) && order.payment_status !== 'PAID').map((order) => <button className="text-button" key={`cancel-${order.id}`} onClick={() => updateOrder(order.id, 'CANCELLED')}>Cancel order #{order.id.slice(0, 8)}</button>)}
 
       {notice && <div className="notice" role="status">{notice}<button onClick={() => setNotice('')} aria-label="Dismiss message">×</button></div>}
 

@@ -1,18 +1,18 @@
-import 'dotenv/config';
 import pg from 'pg';
+import { validateDatabaseEnvironment } from './db-config.js';
+import { loadBackendEnvironment } from './load-env.js';
+
+loadBackendEnvironment();
 
 const { Pool } = pg;
-
-if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL must be configured');
-}
+const databaseConfig = validateDatabaseEnvironment();
 
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: databaseConfig.DATABASE_URL,
   max: 20,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
-  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
+  ssl: databaseConfig.DATABASE_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
 });
 
 pool.on('error', (error) => {

@@ -116,7 +116,7 @@ export async function transitionOrder(
   actorId: string,
   actorRole: string,
 ) {
-  return inTransaction(async (client) => {
+  const transition = await inTransaction(async (client) => {
     const result = await client.query<{ status: OrderStatus; customer_id: string; vendor_user_id: string; courier_id: string | null; payment_status: string }>(
       `SELECT o.status, o.customer_id, v.user_id AS vendor_user_id, o.courier_id, o.payment_status
        FROM orders o JOIN vendors v ON v.id = o.vendor_id WHERE o.id = $1 FOR UPDATE OF o`,
@@ -128,7 +128,6 @@ export async function transitionOrder(
     if (actorRole === 'CUSTOMER' && (order.customer_id !== actorId || nextStatus !== 'CANCELLED')) {
       throw new Error('FORBIDDEN');
     }
-    if (actorRole === 'CUSTOMER' && order.payment_status === 'PAID') throw new Error('REFUND_REQUIRED');
     if (actorRole === 'VENDOR' && order.vendor_user_id !== actorId) throw new Error('FORBIDDEN');
     if (actorRole === 'COURIER' && order.courier_id !== actorId) throw new Error('FORBIDDEN');
     const allowedByRole: Record<string, OrderStatus[]> = {
@@ -138,13 +137,58 @@ export async function transitionOrder(
     };
     if (actorRole !== 'CUSTOMER' && !allowedByRole[actorRole]?.includes(nextStatus)) throw new Error('FORBIDDEN');
 
-    await client.query('UPDATE orders SET status = $2, updated_at = NOW() WHERE id = $1', [orderId, nextStatus]);
+    if (nextStatus === 'CANCELLED' && order.payment_status === 'PAID') {
+      const payment = await client.query<{ id: string; provider: string; provider_reference: string }>(
+        `SELECT id, provider, provider_reference FROM payments
+         WHERE order_id = $1 AND status = 'SUCCESS' ORDER BY updated_at DESC LIMIT 1 FOR UPDATE`,
+        [orderId],
+      );
+      await client.query('UPDATE orders SET payment_reconciliation_required = TRUE, updated_at = NOW() WHERE id = $1', [orderId]);
+      if (payment.rows[0]) {
+        await client.query(
+          `INSERT INTO payment_reconciliation_events
+            (order_id, payment_id, provider, provider_reference, reason, details)
+           VALUES ($1, $2, $3, $4, 'CUSTOMER_CANCELLATION_AFTER_PAYMENT', $5::JSONB)`,
+          [orderId, payment.rows[0].id, payment.rows[0].provider, payment.rows[0].provider_reference, JSON.stringify({ actorId, actorRole })],
+        );
+      }
+      return { error: 'REFUND_REQUIRED' as const };
+    }
+
+    let paymentReconciliationRequired = false;
+    if (nextStatus === 'CANCELLED') {
+      const openPayments = await client.query<{ id: string; provider: string; provider_reference: string }>(
+        `UPDATE payments SET status = 'RECONCILIATION_REQUIRED', updated_at = NOW()
+         WHERE order_id = $1 AND status = 'INITIALIZED'
+         RETURNING id, provider, provider_reference`,
+        [orderId],
+      );
+      paymentReconciliationRequired = openPayments.rows.length > 0;
+      for (const payment of openPayments.rows) {
+        await client.query(
+          `INSERT INTO payment_reconciliation_events
+            (order_id, payment_id, provider, provider_reference, reason, details)
+           VALUES ($1, $2, $3, $4, 'CUSTOMER_CANCELLED_WITH_OPEN_PAYMENT', $5::JSONB)`,
+          [orderId, payment.id, payment.provider, payment.provider_reference, JSON.stringify({ actorId, actorRole })],
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE orders SET status = $2, cancelled_at = CASE WHEN $2 = 'CANCELLED' THEN NOW() ELSE cancelled_at END,
+         payment_status = CASE WHEN $2 = 'CANCELLED' AND payment_status = 'PENDING' THEN 'FAILED' ELSE payment_status END,
+         payment_reconciliation_required = payment_reconciliation_required OR $3,
+         updated_at = NOW() WHERE id = $1`,
+      [orderId, nextStatus, paymentReconciliationRequired],
+    );
     await client.query(
       'INSERT INTO order_status_history (order_id, status, changed_by) VALUES ($1, $2, $3)',
       [orderId, nextStatus, actorId],
     );
-    return { id: orderId, status: nextStatus, customerId: order.customer_id };
+    return { result: { id: orderId, status: nextStatus, customerId: order.customer_id, paymentReconciliationRequired } };
   });
+  if ('error' in transition) throw new Error(transition.error);
+  return transition.result;
 }
 
 export async function getOrderForActor(orderId: string, actorId: string, actorRole: string) {

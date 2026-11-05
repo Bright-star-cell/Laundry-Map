@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 
-type WorkerRequest = { method: string; url: string };
+type WorkerRequest = { method: string; url: string; mode?: string };
 type WorkerResponse = { ok: boolean; body: string; clone: () => WorkerResponse };
 type WorkerEvent = {
   request?: WorkerRequest;
@@ -62,12 +62,12 @@ test('install caches the app shell and activates the worker immediately', async 
 });
 
 test('activation removes stale caches and claims existing clients', async () => {
-  const worker = await createWorker(async () => response('network'), ['laundry-map-shell-old', 'laundry-map-shell-v1']);
+  const worker = await createWorker(async () => response('network'), ['laundry-map-shell-old', 'laundry-map-shell-v1', 'another-app-cache']);
   let activationTask: Promise<unknown> | undefined;
   worker.handlers.get('activate')?.({ waitUntil(task) { activationTask = task; } });
   await activationTask;
 
-  assert.deepEqual(worker.removedCaches, ['laundry-map-shell-old']);
+  assert.deepEqual(worker.removedCaches, ['laundry-map-shell-old', 'laundry-map-shell-v1']);
   assert.equal(worker.clientsClaimed, true);
 });
 
@@ -83,8 +83,26 @@ test('API requests bypass the cache and offline app requests use the cached shel
   fetchHandler?.({ request: { method: 'GET', url: 'https://laundry.test/api/orders' }, respondWith() { apiHandled = true; } });
   assert.equal(apiHandled, false);
 
+  let baseApiHandled = false;
+  fetchHandler?.({ request: { method: 'GET', url: 'https://laundry.test/api' }, respondWith() { baseApiHandled = true; } });
+  assert.equal(baseApiHandled, false);
+
   let appResponse: Promise<WorkerResponse | undefined> | undefined;
-  fetchHandler?.({ request: { method: 'GET', url: 'https://laundry.test/orders' }, respondWith(result) { appResponse = result; } });
+  fetchHandler?.({ request: { method: 'GET', url: 'https://laundry.test/orders', mode: 'navigate' }, respondWith(result) { appResponse = result; } });
   assert.equal((await appResponse)?.body, 'cached app shell');
   assert.equal(networkRequests, 1);
+});
+
+test('versioned application assets are network-fetched and cached until the event completes', async () => {
+  const worker = await createWorker(async () => response('versioned bundle'));
+  let updateTask: Promise<unknown> | undefined;
+  let assetResponse: Promise<WorkerResponse | undefined> | undefined;
+  worker.handlers.get('fetch')?.({
+    request: { method: 'GET', url: 'https://laundry.test/_next/static/chunks/app.js' },
+    waitUntil(task) { updateTask = task; },
+    respondWith(task) { assetResponse = task; },
+  });
+  assert.equal((await assetResponse)?.body, 'versioned bundle');
+  await updateTask;
+  assert.equal(worker.entries.get('https://laundry.test/_next/static/chunks/app.js')?.body, 'versioned bundle');
 });

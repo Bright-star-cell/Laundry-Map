@@ -3,19 +3,22 @@ services:
     profiles: ["development"]
     image: node:22-alpine
     working_dir: /workspaces/Laundry-Map
-    command: sh -c "npm ci && npm run dev"
+    command: sh -c "npm ci && npm run migrate:dev -w @laundry-map/backend && npm run dev"
     environment:
       NODE_ENV: development
       PORT: 4000
-      DATABASE_URL: postgres://laundry:laundry@postgres:5432/laundry_map
-      DATABASE_SSL: "false"
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: ${JWT_SECRET:-laundry-map-local-development-secret-change-before-deploy}
+      DATABASE_URL: ${DATABASE_URL:-postgres://laundry:laundry@postgres:5432/laundry_map}
+      DATABASE_SSL: ${DATABASE_SSL:-false}
+      REDIS_URL: ${REDIS_URL:-redis://:laundry-map-local-cache-password@redis:6379}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-12h}
       WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
       PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
+      FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:-}
       FLUTTERWAVE_SECRET_HASH: ${FLUTTERWAVE_SECRET_HASH:-}
+      TRUST_PROXY: ${TRUST_PROXY:-loopback}
+      SOCKET_IO_TRANSPORTS: ${SOCKET_IO_TRANSPORTS:-websocket,polling}
     volumes:
       - .:/workspaces/Laundry-Map
       - root_node_modules:/workspaces/Laundry-Map/node_modules
@@ -30,11 +33,12 @@ services:
     restart: unless-stopped
 
   postgres:
+    profiles: ["development"]
     image: postgis/postgis:16-3.4
     environment:
       POSTGRES_DB: laundry_map
-      POSTGRES_USER: laundry
-      POSTGRES_PASSWORD: laundry
+      POSTGRES_USER: ${POSTGRES_USER:-laundry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-laundry}
     ports:
       - "5432:5432"
     volumes:
@@ -42,21 +46,24 @@ services:
       - ./backend/db/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
       - ./backend/db/002_seed.sql:/docker-entrypoint-initdb.d/002_seed.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U laundry -d laundry_map"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d laundry_map"]
       interval: 5s
       timeout: 3s
       retries: 20
     restart: unless-stopped
 
   redis:
+    profiles: ["development"]
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    command: ["sh", "-c", "exec redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-laundry-map-local-cache-password}
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -70,21 +77,20 @@ services:
     environment:
       NODE_ENV: production
       PORT: 4000
-      DATABASE_URL: postgres://laundry:laundry@postgres:5432/laundry_map
-      DATABASE_SSL: ${DATABASE_SSL:-false}
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: ${JWT_SECRET:-laundry-map-local-development-secret-change-before-deploy}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must come from the deployment secret store}
+      DATABASE_SSL: ${DATABASE_SSL:?Set DATABASE_SSL=true for production}
+      REDIS_URL: ${REDIS_URL:?REDIS_URL must be an authenticated rediss:// secret}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must come from the deployment secret store}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-12h}
-      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
-      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-}
-      FLUTTERWAVE_SECRET_HASH: ${FLUTTERWAVE_SECRET_HASH:-}
+      WEB_ORIGIN: ${WEB_ORIGIN:?Set the public HTTPS WEB_ORIGIN}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?Set the public HTTPS NEXT_PUBLIC_API_URL}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:?PAYSTACK_SECRET_KEY must come from the deployment secret store}
+      FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:?FLUTTERWAVE_SECRET_KEY must come from the deployment secret store}
+      FLUTTERWAVE_SECRET_HASH: ${FLUTTERWAVE_SECRET_HASH:?FLUTTERWAVE_SECRET_HASH must come from the deployment secret store}
+      TRUST_PROXY: ${TRUST_PROXY:?Set the trusted reverse-proxy hop count or address}
+      SOCKET_IO_TRANSPORTS: ${SOCKET_IO_TRANSPORTS:-websocket,polling}
     ports:
       - "4000:4000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     restart: unless-stopped
 
   web:
@@ -93,10 +99,10 @@ services:
       context: .
       dockerfile: frontend/Dockerfile
       args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?Set the public HTTPS NEXT_PUBLIC_API_URL}
     environment:
       NODE_ENV: production
-      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?Set the public HTTPS NEXT_PUBLIC_API_URL}
     ports:
       - "3000:3000"
     depends_on:

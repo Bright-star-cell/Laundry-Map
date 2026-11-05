@@ -1,10 +1,9 @@
-import 'dotenv/config';
 import cors from 'cors';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import { createServer } from 'node:http';
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { Server } from 'socket.io';
 import { Redis } from 'ioredis';
 import { createAdapter } from '@socket.io/redis-adapter';
@@ -15,47 +14,29 @@ import { acceptVendorOrder, completeDelivery, createOrder, getOrderForActor, lis
 import { isOrderStatus } from './order-state-machine.js';
 import { login, registerCustomer } from './auth.js';
 import { assignCourier, listCourierJobs, listVendors } from './orders.js';
+import { config } from './config.js';
+import { parsePaymentEvent, processPaymentEvent, verifyFlutterwaveSignature, verifyPaystackSignature } from './payment-events.js';
 
 const app = express();
 const httpServer = createServer(app);
-const jwtSecret = process.env.JWT_SECRET;
-if (!jwtSecret || jwtSecret.length < 32) throw new Error('JWT_SECRET must be at least 32 characters');
-
-const allowedOrigins = (process.env.WEB_ORIGIN ?? 'http://localhost:3000').split(',');
-const io = new Server(httpServer, { cors: { origin: allowedOrigins, credentials: true } });
+const jwtSecret = config.JWT_SECRET;
+const allowedOrigins = config.WEB_ORIGIN;
+app.set('trust proxy', config.TRUST_PROXY);
+const io = new Server(httpServer, {
+  cors: { origin: allowedOrigins, credentials: true },
+  transports: config.socketTransports,
+  cookie: config.production ? { name: 'io', httpOnly: true, sameSite: 'none', secure: true } : false,
+  allowRequest: (request, callback) => {
+    const origin = request.headers.origin;
+    callback(null, !origin || allowedOrigins.includes(origin));
+  },
+});
 const isTestEnvironment = process.env.NODE_ENV === 'test';
-const redis = new Redis(process.env.REDIS_URL ?? 'redis://localhost:6379', { maxRetriesPerRequest: null, lazyConnect: isTestEnvironment });
+const redis = new Redis(process.env.REDIS_URL!, { maxRetriesPerRequest: null, lazyConnect: isTestEnvironment });
 const redisSub = redis.duplicate();
 if (!isTestEnvironment) {
   await Promise.all([redis.ping(), redisSub.ping()]);
   io.adapter(createAdapter(redis, redisSub));
-}
-
-async function confirmPayment(provider: 'PAYSTACK' | 'FLUTTERWAVE', reference: string, amountKobo: number) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await client.query<{ order_id: string; customer_id: string; vendor_user_id: string; amount_kobo: string; status: string }>(
-      `SELECT p.order_id, o.customer_id, v.user_id AS vendor_user_id, p.amount_kobo, p.status
-       FROM payments p JOIN orders o ON o.id = p.order_id JOIN vendors v ON v.id = o.vendor_id
-       WHERE p.provider = $1 AND p.provider_reference = $2 FOR UPDATE OF p, o`,
-      [provider, reference],
-    );
-    const payment = result.rows[0];
-    if (!payment || Number(payment.amount_kobo) !== amountKobo || payment.status !== 'INITIALIZED') {
-      await client.query('COMMIT');
-      return null;
-    }
-    await client.query("UPDATE payments SET status = 'SUCCESS', updated_at = NOW() WHERE provider = $1 AND provider_reference = $2", [provider, reference]);
-    await client.query("UPDATE orders SET payment_status = 'PAID', vendor_response_deadline = NOW() + INTERVAL '2 minutes', updated_at = NOW() WHERE id = $1", [payment.order_id]);
-    await client.query('COMMIT');
-    return { orderId: payment.order_id, customerId: payment.customer_id, vendorUserId: payment.vendor_user_id };
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
 }
 
 interface AuthenticatedRequest extends Request {
@@ -113,51 +94,30 @@ io.on('connection', (socket) => {
 
 app.use(helmet());
 app.use(cors({ origin: allowedOrigins, credentials: true }));
-app.post('/api/payments/paystack/webhook', express.raw({ type: 'application/json', limit: '128kb' }), asyncHandler(async (req, res) => {
-  const secret = process.env.PAYSTACK_SECRET_KEY;
-  const signature = req.header('x-paystack-signature');
-  if (!secret || !signature || !Buffer.isBuffer(req.body)) return res.sendStatus(401);
-  const expected = createHmac('sha512', secret).update(req.body).digest();
-  const supplied = Buffer.from(signature, 'hex');
-  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) return res.sendStatus(401);
-  try {
-    const event = JSON.parse(req.body.toString()) as { event?: string; data?: { reference?: string; amount?: number; currency?: string } };
-    if (event.event === 'charge.success' && event.data?.reference && typeof event.data.amount === 'number' && event.data.currency === 'NGN') {
-      const confirmed = await confirmPayment('PAYSTACK', event.data.reference, event.data.amount);
-      if (confirmed) {
-        const order = await getOrderForActor(confirmed.orderId, confirmed.customerId, 'CUSTOMER');
-        io.to(`user:${confirmed.customerId}`).emit('order:status', { id: confirmed.orderId, paymentStatus: 'PAID' });
-        io.to(`user:${confirmed.vendorUserId}`).emit('order:created', order);
-      }
-    }
-    return res.sendStatus(200);
-  } catch {
-    return res.sendStatus(400);
+async function receivePaymentWebhook(provider: 'PAYSTACK' | 'FLUTTERWAVE', req: Request, res: Response) {
+  if (!Buffer.isBuffer(req.body)) return res.sendStatus(400);
+  const verified = provider === 'PAYSTACK'
+    ? verifyPaystackSignature(req.body, req.header('x-paystack-signature'), process.env.PAYSTACK_SECRET_KEY)
+    : verifyFlutterwaveSignature(req.body, req.header('flutterwave-signature'), process.env.FLUTTERWAVE_SECRET_HASH);
+  if (!verified) return res.sendStatus(401);
+  const event = parsePaymentEvent(provider, req.body);
+  if (!event) return res.status(400).json({ error: 'Invalid payment event' });
+  const processed = await processPaymentEvent(provider, event, req.body);
+  if (processed.result === 'confirmed' && processed.orderId && processed.customerId && processed.vendorUserId) {
+    const order = await getOrderForActor(processed.orderId, processed.customerId, 'CUSTOMER');
+    io.to(`user:${processed.customerId}`).emit('order:status', { id: processed.orderId, paymentStatus: 'PAID' });
+    io.to(`user:${processed.vendorUserId}`).emit('order:created', order);
+  } else if (processed.customerId && processed.orderId && processed.result === 'failed') {
+    io.to(`user:${processed.customerId}`).emit('order:status', { id: processed.orderId, paymentStatus: 'FAILED' });
+  } else if (processed.customerId && processed.orderId && processed.result === 'reconciliation_required') {
+    io.to(`user:${processed.customerId}`).emit('order:status', { id: processed.orderId, paymentReconciliationRequired: true });
   }
-}));
-app.post('/api/payments/flutterwave/webhook', express.raw({ type: 'application/json', limit: '128kb' }), asyncHandler(async (req, res) => {
-  const expected = process.env.FLUTTERWAVE_SECRET_HASH;
-  const supplied = req.header('verif-hash');
-  if (!expected || !supplied) return res.sendStatus(401);
-  const a = Buffer.from(expected);
-  const b = Buffer.from(supplied);
-  if (a.length !== b.length || !timingSafeEqual(a, b)) return res.sendStatus(401);
-  try {
-    const event = JSON.parse(req.body.toString()) as { event?: string; data?: { tx_ref?: string; amount?: number; status?: string; currency?: string } };
-    if (event.data?.status === 'successful' && event.data.tx_ref && typeof event.data.amount === 'number' && event.data.currency === 'NGN') {
-      const amountKobo = Math.round(event.data.amount * 100);
-      const confirmed = await confirmPayment('FLUTTERWAVE', event.data.tx_ref, amountKobo);
-      if (confirmed) {
-        const order = await getOrderForActor(confirmed.orderId, confirmed.customerId, 'CUSTOMER');
-        io.to(`user:${confirmed.customerId}`).emit('order:status', { id: confirmed.orderId, paymentStatus: 'PAID' });
-        io.to(`user:${confirmed.vendorUserId}`).emit('order:created', order);
-      }
-    }
-    return res.sendStatus(200);
-  } catch {
-    return res.sendStatus(400);
-  }
-}));
+  return res.sendStatus(200);
+}
+
+const paymentWebhookLimit = rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false });
+app.post('/api/payments/paystack/webhook', paymentWebhookLimit, express.raw({ type: 'application/json', limit: '128kb' }), asyncHandler(async (req, res) => receivePaymentWebhook('PAYSTACK', req, res)));
+app.post('/api/payments/flutterwave/webhook', paymentWebhookLimit, express.raw({ type: 'application/json', limit: '128kb' }), asyncHandler(async (req, res) => receivePaymentWebhook('FLUTTERWAVE', req, res)));
 app.use(express.json({ limit: '32kb' }));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }));
 
@@ -219,30 +179,81 @@ app.post('/api/payments/initialize', authenticate, asyncHandler(async (req: Auth
   if (req.user?.role !== 'CUSTOMER') return res.status(403).json({ error: 'Customer account required' });
   const parsed = z.object({ orderId: z.string().uuid() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid order id' });
-  const order = await getOrderForActor(parsed.data.orderId, req.user.id, req.user.role);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  if (!process.env.PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Paystack is not configured' });
+  const provider = z.enum(['PAYSTACK', 'FLUTTERWAVE']).default('PAYSTACK').safeParse(req.body?.provider);
+  if (!provider.success) return res.status(400).json({ error: 'Unsupported payment provider' });
+  const providerSecret = provider.data === 'PAYSTACK' ? process.env.PAYSTACK_SECRET_KEY : process.env.FLUTTERWAVE_SECRET_KEY;
+  if (!providerSecret) return res.status(503).json({ error: `${provider.data === 'PAYSTACK' ? 'Paystack' : 'Flutterwave'} is not configured` });
   const reference = `lm_${randomUUID().replaceAll('-', '')}`;
-  const amountKobo = Number(order.subtotal_kobo);
-  const customer = await pool.query<{ email: string }>('SELECT email FROM users WHERE id = $1', [req.user.id]);
-  if (!customer.rowCount) return res.status(404).json({ error: 'Customer account not found' });
-  await pool.query(
-    `INSERT INTO payments (order_id, provider, provider_reference, amount_kobo, status)
-     VALUES ($1, 'PAYSTACK', $2, $3, 'INITIALIZED')`,
-    [parsed.data.orderId, reference, amountKobo],
-  );
-  const response = await fetch('https://api.paystack.co/transaction/initialize', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: customer.rows[0].email, amount: amountKobo, reference, currency: 'NGN', callback_url: `${allowedOrigins[0]}/?order_id=${parsed.data.orderId}` }),
-    signal: AbortSignal.timeout(10_000),
-  });
-  const result = await response.json() as { status?: boolean; data?: { authorization_url?: string } };
-  if (!response.ok || !result.status || !result.data?.authorization_url) {
-    await pool.query("UPDATE payments SET status = 'FAILED', updated_at = NOW() WHERE provider_reference = $1", [reference]);
+  let amountKobo: number;
+  let customerEmail: string;
+  const checkout = await pool.connect();
+  try {
+    await checkout.query('BEGIN');
+    const lockedOrder = await checkout.query<{ status: string; payment_status: string; subtotal_kobo: string }>(
+      'SELECT status, payment_status, subtotal_kobo FROM orders WHERE id = $1 AND customer_id = $2 FOR UPDATE',
+      [parsed.data.orderId, req.user.id],
+    );
+    if (!lockedOrder.rows[0]) {
+      await checkout.query('ROLLBACK');
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (lockedOrder.rows[0].status !== 'CREATED' || !['PENDING', 'FAILED'].includes(lockedOrder.rows[0].payment_status)) {
+      await checkout.query('ROLLBACK');
+      return res.status(409).json({ error: 'Order is not available for payment' });
+    }
+    const activePayment = await checkout.query('SELECT 1 FROM payments WHERE order_id = $1 AND status = \'INITIALIZED\' LIMIT 1', [parsed.data.orderId]);
+    if (activePayment.rows.length) {
+      await checkout.query('ROLLBACK');
+      return res.status(409).json({ error: 'A checkout is already active for this order' });
+    }
+    const customer = await checkout.query<{ email: string }>('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    if (!customer.rows[0]) {
+      await checkout.query('ROLLBACK');
+      return res.status(404).json({ error: 'Customer account not found' });
+    }
+    customerEmail = customer.rows[0].email;
+    amountKobo = Number(lockedOrder.rows[0].subtotal_kobo);
+    await checkout.query(
+      `INSERT INTO payments (order_id, provider, provider_reference, amount_kobo, status)
+       VALUES ($1, $2, $3, $4, 'INITIALIZED')`,
+      [parsed.data.orderId, provider.data, reference, amountKobo],
+    );
+    await checkout.query("UPDATE orders SET payment_status = 'PENDING', updated_at = NOW() WHERE id = $1", [parsed.data.orderId]);
+    await checkout.query('COMMIT');
+  } catch (error) {
+    await checkout.query('ROLLBACK');
+    throw error;
+  } finally {
+    checkout.release();
+  }
+  const isPaystack = provider.data === 'PAYSTACK';
+  const endpoint = isPaystack ? 'https://api.paystack.co/transaction/initialize' : 'https://api.flutterwave.com/v3/payments';
+  const payload = isPaystack
+    ? { email: customerEmail, amount: amountKobo, reference, currency: 'NGN', callback_url: `${allowedOrigins[0]}/?order_id=${parsed.data.orderId}` }
+    : { tx_ref: reference, amount: amountKobo / 100, currency: 'NGN', redirect_url: `${allowedOrigins[0]}/?order_id=${parsed.data.orderId}`, customer: { email: customerEmail }, customizations: { title: 'Laundry Map', description: `Laundry order ${parsed.data.orderId}` } };
+  let response: globalThis.Response;
+  let result: { status?: boolean | string; data?: { authorization_url?: string; link?: string } };
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${providerSecret}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10_000),
+    });
+    result = await response.json() as typeof result;
+  } catch (error) {
+    await pool.query("UPDATE payments SET status = 'FAILED', updated_at = NOW() WHERE provider = $1 AND provider_reference = $2", [provider.data, reference]);
+    console.error(JSON.stringify({ event: 'payment_checkout_initialization_failed', provider: provider.data, reference, error: error instanceof Error ? error.name : 'unknown' }));
     return res.status(502).json({ error: 'Unable to initialize payment' });
   }
-  return res.json({ authorizationUrl: result.data.authorization_url, reference });
+  const authorizationUrl = isPaystack ? result.data?.authorization_url : result.data?.link;
+  const providerAccepted = isPaystack ? result.status === true : result.status === 'success';
+  if (!response.ok || !providerAccepted || !authorizationUrl) {
+    await pool.query("UPDATE payments SET status = 'FAILED', updated_at = NOW() WHERE provider = $1 AND provider_reference = $2", [provider.data, reference]);
+    console.error(JSON.stringify({ event: 'payment_checkout_rejected', provider: provider.data, reference, httpStatus: response.status }));
+    return res.status(502).json({ error: 'Unable to initialize payment' });
+  }
+  return res.json({ authorizationUrl, reference, provider: provider.data });
 }));
 
 app.post('/api/orders', authenticate, asyncHandler(async (req: AuthenticatedRequest, res) => {
@@ -358,7 +369,7 @@ app.post('/api/courier/jobs/:id/accept', authenticate, asyncHandler(async (req: 
 }));
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('Request failed', error);
+  console.error(JSON.stringify({ event: 'http_request_failed', error: error instanceof Error ? error.name : 'unknown' }));
   if (res.headersSent) return;
   res.status(500).json({ error: 'Internal server error' });
 });
