@@ -1,0 +1,54 @@
+name: Export Static PWA ZIP for HostAfrica
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: "Production Backend API URL (HTTPS)"
+        required: true
+        default: "https://api.laundrymap.ng"
+
+jobs:
+  build-and-zip:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install workspace dependencies
+        run: npm ci
+
+      - name: Typecheck frontend
+        run: npx next typegen && npm exec tsc -- --noEmit
+
+      - name: Build static PWA export
+        env:
+          NEXT_PUBLIC_API_URL: ${{ inputs.api_url }}
+        run: npm run build
+
+      - name: Verify static output directory exists
+        run: |
+          test -d out
+          test -f out/index.html
+
+      - name: Zip contents of frontend/out
+        run: |
+          cd out
+          zip -r ../laundrymap-pwa-static.zip .
+
+      - name: Upload static ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: laundrymap-pwa-static-zip
+          path: frontend/laundrymap-pwa-static.zip
+          retention-days: 14
